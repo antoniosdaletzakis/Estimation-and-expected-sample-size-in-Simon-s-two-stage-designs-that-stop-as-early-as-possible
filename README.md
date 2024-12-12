@@ -4,3 +4,5 @@ This repository is about our research work in the Simon's two-stage design in th
 It contains: 
 1) The code that the data were simulated is included as well as the way that the graphs where produced.
 2) The supplementary matterial and the respective code used. 
+
+We calculated a new estimate that is the Uniform minimum variance unbiased estimator (UMVUE) about the specific methodologic question.
