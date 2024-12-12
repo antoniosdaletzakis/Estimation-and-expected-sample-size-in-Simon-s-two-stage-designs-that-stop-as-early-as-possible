@@ -1,1 +1,742 @@
+##########################################################################################################
+###                                                                                                    ###
+###   Estimation and expected sample size in Simon's two-stage designs that stop as early as possible  ###
+###                                                                                                    ###
+##########################################################################################################
 
+
+library(gridExtra)
+library(grid)
+library(plyr)
+library(reshape2)
+library(dplyr)
+library(ggplot2)
+library(ggsci)
+library(snowfall)
+library(rlist)
+
+######################################################################################################################################################################
+## Functions for estimation in SSTS setting
+######################################################################################################################################################################
+set.seed(2405)
+
+## 'Stopped STS' - Function which generates a list of all possible outcomes for a given design
+SSTS.alloutc <- function(n1, n2.max, r1, rt){
+  s1 <- data.frame(n1 = n1, x1 = 0:n1, n2.obs = NA, x2 = NA, TrialSuccess = NA)
+  x1 <- 0:n1
+  alloutc <- do.call(rbind, lapply(x1, FUN = function(i){
+    if(i < r1){
+      m <- data.frame(n1 = n1, x1 = i, n2.obs = NA, x2 = NA, TrialSuccess = FALSE)
+    }
+    if(i >= rt){
+      m <- data.frame(n1 = n1, x1 = i, n2.obs = NA, x2 = NA, TrialSuccess = TRUE)
+    }
+    if(i >= r1 & i < rt){
+      m <- expand.grid(n1 = n1, x1 = i, n2.obs = 1:n2.max, x2 = 0:n2.max)
+      m <- m[m$x2 <= m$n2.obs,]
+      m <- m[(m$x1 + m$x2) <= rt,]
+      m$obsLeft <- n2.max - m$n2.obs 
+      m$xReq <- rt - (m$x1 + m$x2)
+      m <- m[(m$x1 + m$x2) == rt | (m$obsLeft + 1) == m$xReq,]
+      m$obsLeft <- m$xReq <- NULL
+      m$TrialSuccess <- m$x1 + m$x2 == rt
+    }
+    m
+  }))
+  alloutc$xt <- alloutc$x1 + ifelse(is.na(alloutc$x2), 0, alloutc$x2)
+  alloutc$nt <- alloutc$n1 + ifelse(is.na(alloutc$n2), 0, alloutc$n2)
+  tmp1 <- alloutc[!alloutc$TrialSuccess,]
+  tmp2 <- alloutc[alloutc$TrialSuccess,]
+  alloutc <- rbind(tmp1[order(tmp1$xt, tmp1$nt),], tmp2[order(tmp2$xt, -1 * tmp2$nt),])
+  rownames(alloutc) <- NULL
+  ### NEW -- Collapse for each combination of TrialSuccess (delta), xt and nt (=Y))
+  alloutc <-	unique(alloutc[,c('TrialSuccess', 'xt', 'nt')])
+  return(alloutc)
+}
+
+## 'Stopped STS' - Probability function for a given outcome (given p)
+SSTS.probfun <- function(r1, rt, n1, n2.max, y, xt, p){
+  if((y == n1 & xt < r1) | (y == n1 & xt >= rt)){
+    prob <- dbinom(xt, n1, p)
+  }
+  if(y > n1 & xt < rt){
+    lt <- n1 + n2.max - rt + 1 
+    prob <- sum(sapply(r1:(rt-1), FUN = function(j) choose(y - n1 - 1, xt - j) * choose(n1, j) * p^(xt) * (1-p)^lt))
+  }
+  if(y > n1 & xt == rt){
+    prob <- sum(sapply(r1:(rt-1), FUN = function(j) choose(y - n1 - 1, rt - j - 1) * choose(n1, j) * p^(rt) * (1-p)^(y - rt)))
+  }
+  return(prob)
+}
+
+## 'Stopped STS' - Estimation function (new + CI)
+SSTS.RRest <- function(n1, n2.max, r1, rt, y, xt, ci = T){
+  if(y == n1){
+    est <- xt / n1
+  }
+  if(y > n1 & xt < rt){
+    num <- sum(sapply(r1:(rt - 1), FUN = function(j) choose(y - n1 - 1, xt - j) * choose(n1 - 1, j - 1)))
+    den <- sum(sapply(r1:(rt - 1), FUN = function(j) choose(y - n1 - 1, xt - j) * choose(n1, j)))
+    est <- num / den
+  }
+  if(y > n1 & xt == rt){
+    num <- sum(sapply(r1:(rt - 1), FUN = function(j) choose(y - n1 - 1, xt - j - 1) * choose(n1 - 1, j - 1)))
+    den <- sum(sapply(r1:(rt - 1), FUN = function(j) choose(y - n1 - 1, xt - j - 1) * choose(n1, j)))
+    est <- num / den			
+  }
+  if(!ci) return(c(est = est))		
+  if(ci){
+    all <- SSTS.alloutc(n1 = n1, n2.max = n2.max, r1 = r1, rt = rt)
+    f <- function(p.accent){
+      all$prob <- sapply(1:nrow(all), FUN = function(i) SSTS.probfun(r1 = r1, rt = rt, n1 = n1, n2.max = n2.max, y = all$nt[i], xt = all$xt[i], p = p.accent))
+      all$ind <- ifelse(all$nt == y & all$xt == xt, 1, 0)		
+      sum(all$prob[which(all$ind == 1)[1]:nrow(all)])
+    }
+    f1 <- function(p.accent){
+      all$prob <- sapply(1:nrow(all), FUN = function(i) SSTS.probfun(r1 = r1, rt = rt, n1 = n1, n2.max = n2.max, y = all$nt[i], xt = all$xt[i], p = p.accent))
+      all$ind <- ifelse(all$nt == y & all$xt == xt, 1, 0)		
+      sum(all$prob[(which(all$ind == 1)[1]+1):nrow(all)])
+    }
+    f <- Vectorize(f)
+    CI.L <- optim(par = 0.5, fn = function(i) abs(f(p.accent = i) - 0.025), lower = 0, upper = 1, method = 'Brent')$par
+    CI.U <- optim(par = 0.5, fn = function(i) abs(f1(p.accent = i) - 0.975), lower = 0, upper = 1, method = 'Brent')$par
+    if(xt == 0){
+      CI.L <- 0
+    }
+    if(xt == y){
+      CI.U <- 1
+    }
+    return(c(est = est, CI.L = CI.L, CI.U = CI.U))
+  }}
+
+## Function to obtain estimate by REF  (UMVUE in STS)
+STS.RRest <- function(n1, nt, r1, x1, xt = NA){
+  if(x1 <=r1 | n1 >= nt) est <- x1 / n1   # with n1>=nt includes the early termination
+  if(x1 > r1 & n1 < nt){
+    i.max <- (xt^n1)
+    i <- r1 + 1
+    num <- choose(n1 - 1, i - 1) * choose(nt - n1, xt - i)
+    den <- choose(n1, i) * choose(nt - n1, xt - i)
+    repeat{
+      i <- i + 1 + xt
+      num <- choose(n1 - 1, i - 1) * choose(nt - n1, xt - i)
+      den <- choose(n1, i) * choose(nt - n1, xt - i)
+      if((num <= .Machine$`double.eps` & den <= .Machine$`double.eps`) | i > i.max) break
+    }
+    i.seq <- (r1 + 1):i
+    num <- sum(choose(n1 - 1, i.seq - 1) * choose(nt - n1, xt - i.seq))
+    den <- sum(choose(n1, i.seq) * choose(nt - n1, xt - i.seq))
+    est <- num / den	
+  }
+  est
+}
+
+######################################################################################################################################################################
+## Functions for the simulation
+######################################################################################################################################################################
+
+## Function to arrange plots
+grid_arrange_shared_legend <- function(...,ncol = length(list(...)), nrow = 1, position = c("bottom", "right")) {
+  plots <- list(...)
+  position <- match.arg(position)
+  g <-
+    ggplotGrob(plots[[1]] + theme(legend.position = position))$grobs
+  legend <- g[[which(sapply(g, function(x)
+    x$name) == "guide-box")]]
+  lheight <- sum(legend$height)
+  lwidth <- sum(legend$width)
+  gl <- lapply(plots, function(x)
+    x + theme(legend.position = "none"))
+  gl <- c(gl, ncol = ncol, nrow = nrow)
+  combined <- switch(
+    position,
+    "bottom" = arrangeGrob(
+      do.call(arrangeGrob, gl),
+      legend,
+      ncol = 1,
+      heights = unit.c(unit(1, "npc") - lheight, lheight)
+    ),
+    "right" = arrangeGrob(
+      do.call(arrangeGrob, gl),
+      legend,
+      ncol = 2,
+      widths = unit.c(unit(1, "npc") - lwidth, lwidth)
+    ))
+  grid.newpage()
+  grid.draw(combined)
+  # return gtable invisibly
+  invisible(combined)
+}
+
+coverage_graph <- function(coverage)
+{
+  coverage_NA <- coverage[[5]]
+  coverage <- coverage[[4]]
+  cov_na_dat <- data.frame(col_na = round(coverage_NA, 2)*100, ID = 1:length(coverage$data$p.true.gr1))
+  cov_na <- ggplot(cov_na_dat, aes(x = ID, y = "NA %", label = col_na)) +
+    geom_text(size = 3.5, colour = "red") + 
+    theme_minimal() + 
+    scale_y_discrete( name = "") + scale_x_continuous(breaks = NULL, name = "")+
+    theme(panel.grid.major = element_blank(), legend.position = "none",
+          panel.border = element_blank(), axis.text.x =  element_blank(),
+          axis.ticks =  element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_text(angle = 0, vjust = 0.5, hjust = 0.5))
+  
+  
+  gA <- ggplotGrob(coverage)
+  gB <- ggplotGrob(cov_na)
+  
+  maxWidth = grid::unit.pmax(gA$widths[2:3], gB$widths[2:3])
+  gA$widths[2:3] <- as.list(maxWidth)
+  gB$widths[2:3] <- as.list(maxWidth)
+  g <- arrangeGrob(gA, gB, ncol = 1, heights = c(10, 1))
+  return(g)
+}
+
+###################################################################################################################
+## Simulation function
+###################################################################################################################
+
+## 'Stopped STS' - Data simulation function
+SSTS.simdatf <- function(p.true, n1, r1, n2.max, rt, numsim = 100){
+  
+  s0 <- replicate(numsim, rbinom(n1 + n2.max, 1, p.true))
+  s <- s0
+  for(i in 1:numsim){
+    if(sum(s0[1:n1, i]) < r1) s0[(n1+1):(n1+n2.max), i] <- NA	## s0 = 'traditional' application of STS
+    if(sum(s[1:n1, i]) < r1) s[(n1+1):(n1+n2.max), i] <- NA	## Stop after stage 1 for futility
+    if(sum(s[1:n1, i]) >= rt) s[(n1+1):(n1+n2.max), i] <- NA	## Stop after stage 1 for efficacy
+    if(sum(s[1:n1, i]) >= r1 & sum(s[1:n1, i]) < rt){		## Continue to stage 2
+      if(sum(s[,i]) >= rt){						## Efficacy after stage 2			
+        ind <- which(cumsum(s[,i]) >= rt)[1]
+        if(ind < (n1 + n2.max)) s[,i][(ind + 1):(n1 + n2.max)] <- NA
+      }
+      if(sum(s[,i], na.rm = T) < rt){				## Futility after stage 2
+        k <- which((rt - cumsum(s[,i])) - ((n1 + n2.max):1) >= 0)[1]
+        if(is.na(k)) next
+        if(k == n1 + n2.max) next
+        s[(k + 1):(n1 + n2.max), i] <- NA
+      }}}
+  s <- t(s)
+  s0 <- t(s0)
+  spec <- data.frame(p.true = p.true, n1 = n1, r1 = r1, n2.max = n2.max, rt = rt)
+  return(list(simdat.STS = s0, simdat.SSTS = s, spec = spec))			## Each row represents one simulated trial
+}
+
+
+total_sim <- function(n1, r1, n2.max, rt, seq.level = 0.025, ci = F, nums = 100, p.0 = NA, p.1 = NA, cpus = 4){
+  p.true.gr <- seq(0, 1, seq.level)		
+  if(ci){	## if ci = T, find the coverage of the proposed estimator
+    #p.true.gr1 <- p.true.gr
+    #if(!is.na(p.0) & !is.na(p.1)) p.true.gr1 <- p.true.gr[p.true.gr >= (p.0 - 0.2) & p.true.gr <= (p.1 + 0.2)]
+    est <- lapply(1:length(p.true.gr), FUN = function(x) rep(NA, nums))
+    cilow <- lapply(1:length(p.true.gr), FUN = function(x) rep(NA, nums))
+    cihigh <- lapply(1:length(p.true.gr), FUN = function(x) rep(NA, nums))
+    for(p in 1:length(p.true.gr)){
+      sim <- SSTS.simdatf(p.true = p.true.gr[p], n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, numsim = nums)
+      
+      ## Alternative with parallel (make sure 'snowfall' package is loaded) - also check carefully
+      sfInit(parallel = TRUE, cpus = cpus)	## set number of CPUs
+      sfExport('SSTS.RRest', 'sim', 'n1', 'n2.max', 'r1', 'rt', 'SSTS.alloutc', 'SSTS.probfun')
+      res <- sfLapply(1:nums, fun = function(i) SSTS.RRest(n1 = n1, n2.max = n2.max, r1 = r1, rt = rt, y = sum(!is.na(sim$simdat.SSTS[i,])), xt = sum(sim$simdat.SSTS[i,], na.rm = TRUE), ci = T))
+      sfStop()
+      res <- do.call(rbind, res)
+      est[[p]] <- res[,1]
+      cilow[[p]] <- res[,2]
+      cihigh[[p]] <- res[,3]
+    }
+    
+    coverage <- sapply(1:length(cilow), FUN = function(p) mean(cilow[[p]] <= p.true.gr[p] & cihigh[[p]] >= p.true.gr[p], na.rm = T))
+    dat5 <- as.data.frame(cbind(Coverage = coverage, p.true.gr = p.true.gr))
+    plot1_cov <- ggplot(data = dat5, aes(y = coverage, x = p.true.gr)) + geom_line() + theme_light() + labs(x = "True value of p", y = "Coverage Probability") + ylim(0.8, 1)
+    
+    if(!is.na(p.0) & !is.na(p.1)) plot1_cov <- plot1_cov + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1)
+    return(list(cilow = cilow, cihigh = cihigh, coverage = coverage, plot1_cov = plot1_cov))
+  }
+  
+  if(!ci){	## if ci = F, find estimated values for proposed estimator + 3 others
+    est.umvue.SSTS <- lapply(1:length(p.true.gr), FUN = function(x) rep(NA, nums))
+    est.umvue.STS <- lapply(1:length(p.true.gr), FUN = function(x) rep(NA, nums))
+    est.sampprop.SSTS <- lapply(1:length(p.true.gr), FUN = function(x) rep(NA, nums))
+    est.sampprop.STS <- lapply(1:length(p.true.gr), FUN = function(x) rep(NA, nums))
+    exp.samplesize.SSTS <- lapply(1:length(p.true.gr), FUN = function(x) rep(NA, nums))
+    for(p in 1:length(p.true.gr)){
+      sim <- SSTS.simdatf(p.true = p.true.gr[p], n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, numsim = nums)
+      for(i in 1:nums){
+        est.umvue.SSTS[[p]][i] <- SSTS.RRest(n1 = n1, n2.max = n2.max, r1 = r1, rt = rt, y = sum(!is.na(sim$simdat.SSTS[i,])), xt = sum(sim$simdat.SSTS[i,], na.rm = TRUE), ci = F)
+        est.umvue.STS[[p]][i] <- STS.RRest(n1 = n1, nt = n1 + n2.max, r1 = r1, x1 = sum(sim$simdat.STS[i, 1:n1]),  xt = sum(sim$simdat.STS[i,], na.rm = TRUE))
+        exp.samplesize.SSTS[[p]][i] <- sum(!is.na(sim$simdat.SSTS[i,]))
+        est.sampprop.SSTS[[p]][i] <- mean(sim$simdat.SSTS[i,], na.rm = TRUE)        	#sample proportion early
+        est.sampprop.STS[[p]][i] <- mean(sim$simdat.STS[i,], na.rm = TRUE)  		#sample proportion STS
+      }}
+    
+    ## UMVUE SSTS - Expected sample size + bias and MSE of estimate
+    est.umvue.SSTS_exp.ss <- sapply(1:length(p.true.gr), FUN = function(p) mean(exp.samplesize.SSTS[[p]]))
+    est.umvue.SSTS_bias <- sapply(1:length(p.true.gr), FUN = function(p) mean(est.umvue.SSTS[[p]])) - p.true.gr
+    est.umvue.SSTS_se <- sapply(1:length(p.true.gr), FUN = function(p) sd(est.umvue.SSTS[[p]]))
+    est.umvue.SSTS_mse <- est.umvue.SSTS_bias^2 + est.umvue.SSTS_se^2
+    
+    ## UMVUE SSTS - Expected sample size + bias and MSE of estimate
+    est.umvue.STS_bias <- sapply(1:length(p.true.gr), FUN = function(p) mean(est.umvue.STS[[p]])) - p.true.gr
+    est.umvue.STS_se <- sapply(1:length(p.true.gr), FUN = function(p) sd(est.umvue.STS[[p]]))
+    est.umvue.STS_mse <- est.umvue.STS_bias^2 + est.umvue.STS_se^2
+    
+    ## Sample proportion SSTS
+    est.sampprop.SSTS_bias <- sapply(1:length(p.true.gr), FUN = function(p) mean(est.sampprop.SSTS[[p]])) - p.true.gr
+    est.sampprop.SSTS_se <- sapply(1:length(p.true.gr), FUN = function(p) sd(est.sampprop.SSTS[[p]]))
+    est.sampprop.SSTS_mse <- est.sampprop.SSTS_bias^2 + est.sampprop.SSTS_se^2
+    
+    ## Sample proportion STS
+    est.sampprop.STS_bias <- sapply(1:length(p.true.gr), FUN = function(p) mean(est.sampprop.STS[[p]])) - p.true.gr
+    est.sampprop.STS_se <- sapply(1:length(p.true.gr), FUN = function(p) sd(est.sampprop.STS[[p]]))
+    est.sampprop.STS_mse <- est.sampprop.STS_bias^2 + est.sampprop.STS_se^2
+    
+    ## Plots
+    dat1 <- melt(as.data.frame(cbind(est.umvue.SSTS_bias, est.umvue.STS_bias, est.sampprop.SSTS_bias, est.sampprop.STS_bias, p.true.gr), stringsAsFactors = F), id.vars = "p.true.gr")
+    dat2 <- melt(as.data.frame(cbind(est.umvue.SSTS_mse, est.umvue.STS_mse, est.sampprop.SSTS_mse, est.sampprop.STS_mse, p.true.gr), stringsAsFactors = F), id.vars = "p.true.gr")
+    dat1$variable <- as.character(dat1$variable)
+    dat2$variable <- as.character(dat2$variable)
+    
+    dat1$lines <- NA
+    dat1$lines[which(dat1$variable == "est.umvue.SSTS_bias")] <- "Stopped STS"
+    dat1$lines[which(dat1$variable == "est.umvue.STS_bias")] <- "STS"
+    dat1$lines[which(dat1$variable == "est.sampprop.SSTS_bias")] <- "Stopped STS"
+    dat1$lines[which(dat1$variable == "est.sampprop.STS_bias")] <- "STS"
+    
+    dat2$lines <- NA
+    dat2$lines[which(dat2$variable == "est.umvue.SSTS_mse")] <- "Stopped STS"
+    dat2$lines[which(dat2$variable == "est.umvue.STS_mse")] <- "STS"
+    dat2$lines[which(dat2$variable == "est.sampprop.SSTS_mse")] <- "Stopped STS"
+    dat2$lines[which(dat2$variable == "est.sampprop.STS_mse")] <- "STS"
+    
+    dat1$variable[dat1$variable == 'est.umvue.SSTS_bias'] <- 'umvue.SSTS'
+    dat1$variable[dat1$variable == 'est.sampprop.SSTS_bias'] <- 'sampprop.SSTS'
+    dat1$variable[dat1$variable == 'est.sampprop.STS_bias'] <- 'sampprop.STS'
+    dat1$variable[dat1$variable == 'est.umvue.STS_bias'] <- 'umvue.STS'
+    
+    plot1 <- ggplot(data = dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+    plot2 <- ggplot(data = dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+    
+    if(!is.na(p.0) & !is.na(p.1)){
+      plot1 <- ggplot(data = dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+      plot2 <- ggplot(data = dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+    }
+    
+    PET <- rep(NA, length(p.true.gr))
+    STS_exp.ss <- rep(NA, length(p.true.gr))
+    for (i in 1:length(p.true.gr)){
+      PET[i] <- sum(dbinom(0:(r1 - 1), n1, p.true.gr[i]))
+      STS_exp.ss[i] <- n1 + (1 - PET[i]) * n2.max
+    }
+    
+    return(list(plot1 = plot1, plot2 = plot2, est.umvue.SSTS_exp.ss = est.umvue.SSTS_exp.ss, STS_exp.ss = STS_exp.ss, dat1 = dat1, dat2 = dat2))
+  }}
+
+
+
+
+
+  ###############################################################################
+  ## Run simulation study - 90% POWER - BIAS and MSE
+  ###############################################################################
+  numsim <- 1000000  # You can set the simulations number here and its the same for all cases
+  seq.level <- 0.025 
+
+  p.0 <- 0.1; p.1 <- 0.3; n1 <- 18; r1 <- 3; n2.max <- 17; rt <- 7
+    sim1_est <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = F, seq.level = seq.level, nums = numsim)
+  p.0 <- 0.2; p.1 <- 0.4; n1 <- 19; r1 <- 5; n2.max <- 35; rt <- 16
+    sim2_est <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = F, seq.level = seq.level, nums = numsim)
+  p.0 <- 0.3; p.1 <- 0.5; n1 <- 24; r1 <- 9; n2.max <- 39; rt <- 25
+    sim3_est <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = F, seq.level = seq.level, nums = numsim)
+  p.0 <- 0.4; p.1 <- 0.6; n1 <- 25; r1 <- 12; n2.max <- 41; rt <- 33
+    sim4_est <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = F, seq.level = seq.level, nums = numsim)
+  p.0 <- 0.5; p.1 <- 0.7; n1 <- 24; r1 <- 14; n2.max <- 37; rt <- 37
+    sim5_est <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = F, seq.level = seq.level, nums = numsim)
+  p.0 <- 0.6; p.1 <- 0.8; n1 <- 19; r1 <- 13; n2.max <- 34; rt <- 37
+    sim6_est <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = F, seq.level = seq.level, nums = numsim)
+  p.0 <- 0.7; p.1 <- 0.9; n1 <- 15; r1 <- 12; n2.max <- 21; rt <- 30
+    sim7_est <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = F, seq.level = seq.level, nums = numsim)
+
+  ###############################################################################
+  ## Run simulation study - 80% POWER - BIAS and MSE
+  ###############################################################################
+  p.0 <- 0.1; p.1 <- 0.3; n1 <- 10; r1 <- 2; n2.max <- 19; rt <-6;
+    sim1_est_80 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = F, seq.level = seq.level, nums = numsim)
+  p.0 <- 0.2; p.1 <- 0.4; n1 <- 13; r1 <- 4; n2.max <- 30; rt <-13;
+    sim2_est_80 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = F, seq.level = seq.level, nums = numsim)
+  p.0 <- 0.3; p.1 <- 0.5; n1 <- 15; r1 <- 6; n2.max <- 31; rt <- 19;
+    sim3_est_80 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = F, seq.level = seq.level, nums = numsim)
+  p.0 <- 0.4; p.1 <- 0.6; n1 <- 16; r1 <- 8; n2.max <- 28; rt <- 24;
+    sim4_est_80 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = F, seq.level = seq.level, nums = numsim)
+  p.0 <- 0.5; p.1 <- 0.7; n1 <- 15; r1 <- 9; n2.max <- 28; rt <- 27;
+    sim5_est_80 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = F, seq.level = seq.level, nums = numsim)
+  p.0 <- 0.6; p.1 <- 0.8; n1 <- 11; r1 <- 8; n2.max <- 32; rt <- 31;
+    sim6_est_80 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = F, seq.level = seq.level, nums = numsim)
+  p.0 <- 0.7; p.1 <- 0.9; n1 <- 6; r1 <- 5; n2.max <- 21; rt <- 23;
+    sim7_est_80 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = F, seq.level = seq.level, nums = numsim)
+    
+  ###############################################################################
+  ## Run simulation study - 90% POWER - COVERAGE
+  ###############################################################################
+  numsim <- 1000000
+  p.0 <- 0.1; p.1 <- 0.3; n1 <- 18; r1 <- 3; n2.max <- 17; rt <- 7
+    sim1_ci <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = T, seq.level = seq.level, nums = numsim, cpus = 16)
+  p.0 <- 0.2; p.1 <- 0.4; n1 <- 19; r1 <- 5; n2.max <- 35; rt <- 16
+    sim2_ci <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = T, seq.level = seq.level, nums = numsim, cpus = 16)
+  p.0 <- 0.3; p.1 <- 0.5; n1 <- 24; r1 <- 9; n2.max <- 39; rt <- 25
+    sim3_ci <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = T, seq.level = seq.level, nums = numsim, cpus = 16)
+  p.0 <- 0.4; p.1 <- 0.6; n1 <- 25; r1 <- 12; n2.max <- 41; rt <- 33
+    sim4_ci <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = T, seq.level = seq.level, nums = numsim, cpus = 16)
+  p.0 <- 0.5; p.1 <- 0.7; n1 <- 24; r1 <- 14; n2.max <- 37; rt <- 37
+    sim5_ci <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = T, seq.level = seq.level, nums = numsim, cpus = 16)
+  p.0 <- 0.6; p.1 <- 0.8; n1 <- 19; r1 <- 13; n2.max <- 34; rt <- 37
+    sim6_ci <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = T, seq.level = seq.level, nums = numsim, cpus = 16)
+  p.0 <- 0.7; p.1 <- 0.9; n1 <- 15; r1 <- 12; n2.max <- 21; rt <- 30
+    sim7_ci <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = T, seq.level = seq.level, nums = numsim, cpus = 16)
+    
+  ###############################################################################
+  ## Run simulation study - 80% POWER - COVERAGE
+  ###############################################################################
+  p.0 <- 0.1; p.1 <- 0.3; n1 <- 10; r1 <- 2; n2.max <- 19; rt <-6;
+    sim1_ci_80 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = T, seq.level = seq.level, nums = numsim, cpus = 16)
+  p.0 <- 0.2; p.1 <- 0.4; n1 <- 13; r1 <- 4; n2.max <- 30; rt <-13;
+    sim2_ci_80 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = T, seq.level = seq.level, nums = numsim, cpus = 16)
+  p.0 <- 0.3; p.1 <- 0.5; n1 <- 15; r1 <- 6; n2.max <- 31; rt <- 19;
+    sim3_ci_80 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = T, seq.level = seq.level, nums = numsim, cpus = 16)
+  p.0 <- 0.4; p.1 <- 0.6; n1 <- 16; r1 <- 8; n2.max <- 28; rt <- 24;
+    sim4_ci_80 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = T, seq.level = seq.level, nums = numsim, cpus = 16)
+  p.0 <- 0.5; p.1 <- 0.7; n1 <- 15; r1 <- 9; n2.max <- 28; rt <- 27;
+    sim5_ci_80 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = T, seq.level = seq.level, nums = numsim, cpus = 16)
+  p.0 <- 0.6; p.1 <- 0.8; n1 <- 11; r1 <- 8; n2.max <- 32; rt <- 31;
+    sim6_ci_80 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = T, seq.level = seq.level, nums = numsim, cpus = 16)
+  p.0 <- 0.7; p.1 <- 0.9; n1 <- 6; r1 <- 5; n2.max <- 21; rt <- 23;
+    sim7_ci_80 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci = T, seq.level = seq.level, nums = numsim, cpus = 16)
+
+  ###############################################################################
+  ###### Estimation p0-p1 difference
+  ###############################################################################
+  p.0 <- 0.3; p.1 <- 0.45; n1 <- 40; r1 <- 14; n2.max <- 70; rt <- 41;
+    sim7_est_15 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci=F, seq.level = seq.level, nums=numsim)
+  p.0 <- 0.3; p.1 <- 0.5; n1 <- 24; r1 <- 9; n2.max <- 39; rt <- 25;
+    sim7_est_20 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci=F, seq.level = seq.level, nums=numsim)
+  p.0 <- 0.3; p.1 <- 0.55; n1 <- 15; r1 <- 6; n2.max <- 25; rt <- 17;
+    sim7_est_25 <- total_sim(n1 = n1, r1 = r1, n2.max = n2.max, rt = rt, p.0 = p.0, p.1 = p.1, ci=F, seq.level = seq.level, nums=numsim)
+
+  
+  #################################################
+  ########      save lists      ###################
+  #################################################
+  list.save(sim1_ci,file = "sim1_ci.rds")
+  list.save(sim1_ci_80,file = "sim1_ci_80.rds")
+  list.save(sim2_ci,file = "sim2_ci.rds")
+  list.save(sim2_ci_80,file = "sim2_ci_80.rds")
+  list.save(sim3_ci,file = "sim3_ci.rds")
+  list.save(sim3_ci_80,file = "sim3_ci_80.rds")
+  list.save(sim4_ci,file = "sim4_ci.rds")
+  list.save(sim4_ci_80,file = "sim4_ci_80.rds")
+  list.save(sim5_ci,file = "sim5_ci.rds")
+  list.save(sim5_ci_80,file = "sim5_ci_80.rds")
+  list.save(sim6_ci,file = "sim6_ci.rds")
+  list.save(sim6_ci_80,file = "sim6_ci_80.rds")
+  list.save(sim7_ci,file = "sim7_ci.rds")
+  list.save(sim7_ci_80,file = "sim7_ci_80.rds")
+ 
+  list.save(sim1_est,file = "sim1_est.rds")
+  list.save(sim1_est_80,file = "sim1_est_80.rds")
+  list.save(sim2_est,file = "sim2_est.rds")
+  list.save(sim2_est_80,file = "sim2_est_80.rds")
+  list.save(sim3_est,file = "sim3_est.rds")
+  list.save(sim3_est_80,file = "sim3_est_80.rds")
+  list.save(sim4_est,file = "sim4_est.rds")
+  list.save(sim4_est_80,file = "sim4_est_80.rds")
+  list.save(sim5_est,file = "sim5_est.rds")
+  list.save(sim5_est_80,file = "sim5_est_80.rds")
+  list.save(sim6_est,file = "sim6_est.rds")
+  list.save(sim6_est_80,file = "sim6_est_80.rds")
+  list.save(sim7_est,file = "sim7_est.rds")
+  list.save(sim7_est_80,file = "sim7_est_80.rds")
+  
+  list.save(sim7_est_15,file = "sim7_est_15.rds")
+  list.save(sim7_est_20,file = "sim7_est_20.rds")
+  list.save(sim7_est_25,file = "sim7_est_25.rds")
+  #################################################################
+
+####################################################
+##############                          ############
+##############        Sim inference     ############
+##############                          ############
+####################################################
+
+sim1_est <- list.load('sim1_est.rds')
+expected_ss_simon1 <- sim1_est[[4]]
+expected_ss1 <- sim1_est[[3]]
+p.0 <- 0.1; p.1 <- 0.3
+p1 <- ggplot(data = sim1_est$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1)  + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p2 <- ggplot(data = sim1_est$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1)  + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim1_est)
+
+sim2_est <- list.load('sim2_est.rds')
+expected_ss_simon2 <- sim2_est[[4]]
+expected_ss2 <- sim2_est[[3]]
+p.0 <- 0.2; p.1 <- 0.4
+p3 <- ggplot(data = sim2_est$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p4 <- ggplot(data = sim2_est$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim2_est)
+
+sim3_est <- list.load('sim3_est.rds')
+expected_ss_simon3 <- sim3_est[[4]]
+expected_ss3 <- sim3_est[[3]]
+p.0 <- 0.3; p.1 <- 0.5
+p5 <- ggplot(data = sim3_est$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p6 <- ggplot(data = sim3_est$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim3_est)
+
+sim4_est <- list.load('sim4_est.rds')
+expected_ss_simon4 <- sim4_est[[4]]
+expected_ss4 <- sim4_est[[3]]
+p.0 <- 0.4; p.1 <- 0.6
+p7 <- ggplot(data = sim4_est$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p8 <- ggplot(data = sim4_est$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim4_est)
+
+sim5_est <- list.load('sim5_est.rds')
+expected_ss_simon5 <- sim5_est[[4]]
+expected_ss5 <- sim5_est[[3]]
+p.0 <- 0.5; p.1 <- 0.7
+p9 <- ggplot(data = sim5_est$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p10 <- ggplot(data = sim5_est$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim5_est)
+
+sim6_est <- list.load('sim6_est.rds')
+expected_ss_simon6 <- sim6_est[[4]]
+expected_ss6 <- sim6_est[[3]]
+p.0 <- 0.6; p.1 <- 0.8
+p11 <- ggplot(data = sim6_est$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p12 <- ggplot(data = sim6_est$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim6_est)
+
+sim7_est <- list.load('sim7_est.rds')
+expected_ss_simon7 <- sim7_est[[4]]
+expected_ss7 <- sim7_est[[3]]
+p.0 <- 0.7; p.1 <- 0.9
+p13 <- ggplot(data = sim7_est$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p14 <- ggplot(data = sim7_est$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim7_est)
+
+####################################################
+##############                          ############
+##############        Sim 80 inference  ############
+##############                          ############
+####################################################
+
+sim1_est_80 <- list.load('sim1_est_80.rds')
+expected_ss_simon1_80 <- sim1_est_80[[4]]
+expected_ss1_80 <- sim1_est_80[[3]]
+p.0 <- 0.1; p.1 <- 0.3
+p1_80 <- ggplot(data = sim1_est_80$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p2_80 <- ggplot(data = sim1_est_80$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim1_est_80)
+
+sim2_est_80 <- list.load('sim2_est_80.rds')
+expected_ss_simon2_80 <- sim2_est_80[[4]]
+expected_ss2_80 <- sim2_est_80[[3]]
+p.0 <- 0.2; p.1 <- 0.4
+p3_80 <- ggplot(data = sim2_est_80$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p4_80 <- ggplot(data = sim2_est_80$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim2_est_80)
+
+sim3_est_80 <- list.load('sim3_est_80.rds')
+expected_ss_simon3_80 <- sim3_est_80[[4]]
+expected_ss3_80 <- sim3_est_80[[3]]
+p.0 <- 0.3; p.1 <- 0.5
+p5_80 <- ggplot(data = sim3_est_80$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p6_80 <- ggplot(data = sim3_est_80$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim3_est_80)
+
+sim4_est_80 <- list.load('sim4_est_80.rds')
+expected_ss_simon4_80 <- sim4_est_80[[4]]
+expected_ss4_80 <- sim4_est_80[[3]]
+p.0 <- 0.4; p.1 <- 0.6
+p7_80 <- ggplot(data = sim4_est_80$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p8_80 <- ggplot(data = sim4_est_80$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim4_est_80)
+
+sim5_est_80 <- list.load('sim5_est_80.rds')
+expected_ss_simon5_80 <- sim5_est_80[[4]]
+expected_ss5_80 <- sim5_est_80[[3]]
+p.0 <- 0.5; p.1 <- 0.7
+p9_80 <- ggplot(data = sim5_est_80$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p10_80 <- ggplot(data = sim5_est_80$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim5_est_80)
+
+sim6_est_80 <- list.load('sim6_est_80.rds')
+expected_ss_simon6_80 <- sim6_est_80[[4]]
+expected_ss6_80 <- sim6_est_80[[3]]
+p.0 <- 0.6; p.1 <- 0.8
+p11_80 <- ggplot(data = sim6_est_80$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p12_80 <- ggplot(data = sim6_est_80$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim6_est_80)
+
+sim7_est_80 <- list.load('sim7_est_80.rds')
+expected_ss_simon7_80 <- sim7_est_80[[4]]
+expected_ss7_80 <- sim7_est_80[[3]]
+p.0 <- 0.7; p.1 <- 0.9
+p13_80 <- ggplot(data = sim7_est_80$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p14_80 <- ggplot(data = sim7_est_80$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim7_est_80)
+
+
+sim7_est_15 <- list.load('sim7_est_15.rds')
+expected_ss_simon7_15 <- sim7_est_15[[4]]
+expected_ss7_15 <- sim7_est_15[[3]]
+p.0 <- 0.3; p.1 <- 0.45
+p15_15 <- ggplot(data = sim7_est_15$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p16_15 <- ggplot(data = sim7_est_15$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim7_est_15)
+
+sim7_est_20 <- list.load('sim7_est_20.rds')
+expected_ss_simon7_20 <- sim7_est_20[[4]]
+expected_ss7_20 <- sim7_est_20[[3]]
+p.0 <- 0.3; p.1 <- 0.5
+p17_20 <- ggplot(data = sim7_est_20$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p18_20 <- ggplot(data = sim7_est_20$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim7_est_20)
+
+sim7_est_25 <- list.load('sim7_est_25.rds')
+expected_ss_simon7_25 <- sim7_est_25[[4]]
+expected_ss7_25 <- sim7_est_25[[3]]
+p.0 <- 0.3; p.1 <- 0.55
+p19_25 <- ggplot(data = sim7_est_25$dat1, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "Bias") 
+p20_25 <- ggplot(data = sim7_est_25$dat2, aes(y = value, x = p.true.gr, color = variable, linetype = lines)) + geom_line(size = 1) + theme_light() + theme(legend.title = element_blank()) + annotate("rect", xmin = p.0, xmax = p.1, ymin = -Inf, ymax = Inf, alpha = .1) + scale_color_jco() + labs(colour = "", x = "True p", y = "MSE") 
+rm(sim7_est_25)
+
+sim1_ci    <- list.load("sim1_ci.rds")
+sim1_ci_80 <- list.load("sim1_ci_80.rds")
+sim2_ci    <- list.load("sim2_ci.rds")
+sim2_ci_80 <- list.load("sim2_ci_80.rds")
+sim3_ci    <- list.load("sim3_ci.rds")
+sim3_ci_80 <- list.load("sim3_ci_80.rds")
+sim4_ci    <- list.load("sim4_ci.rds")
+sim4_ci_80 <- list.load("sim4_ci_80.rds")
+sim5_ci    <- list.load("sim5_ci.rds")
+sim5_ci_80 <- list.load("sim5_ci_80.rds")
+sim6_ci    <- list.load("sim6_ci.rds")
+sim6_ci_80 <- list.load("sim6_ci_80.rds")
+sim7_ci    <- list.load("sim7_ci.rds")
+sim7_ci_80 <- list.load("sim7_ci_80.rds")
+
+sim1_ci$plot1_cov    <- sim1_ci$plot1_cov + labs(title = bquote(~n[1]==18~","~n[t]==35~","~r[1]==3~","~r[t]==7))
+sim1_ci_80$plot1_cov <- sim1_ci_80$plot1_cov + labs(title = bquote(~n[1]==10~","~n[t]==29~","~r[1]==2~","~r[t]==6))
+sim2_ci$plot1_cov    <- sim2_ci$plot1_cov + labs(title = bquote(~n[1]==19~","~n[t]==54~","~r[1]==5~","~r[t]==16))
+sim2_ci_80$plot1_cov <- sim2_ci_80$plot1_cov + labs(title = bquote(~n[1]==13~","~n[t]==43~","~r[1]==4~","~r[t]==13))
+sim3_ci$plot1_cov    <- sim3_ci$plot1_cov + labs(title = bquote(~n[1]==24~","~n[t]==63~","~r[1]==9~","~r[t]==25))
+sim3_ci_80$plot1_cov <- sim3_ci_80$plot1_cov + labs(title = bquote(~n[1]==15~","~n[t]==46~","~r[1]==6~","~r[t]==19))
+sim4_ci$plot1_cov    <- sim4_ci$plot1_cov + labs(title = bquote(~n[1]==25~","~n[t]==66~","~r[1]==12~","~r[t]==33))
+sim4_ci_80$plot1_cov <- sim4_ci_80$plot1_cov + labs(title = bquote(~n[1]==16~","~n[t]==44~","~r[1]==8~","~r[t]==24))
+sim5_ci$plot1_cov    <- sim5_ci$plot1_cov + labs(title=bquote(~n[1]==24~","~n[t]==61~","~r[1]==13~","~r[t]==36))
+sim5_ci_80$plot1_cov <- sim5_ci_80$plot1_cov + labs(title=bquote(~n[1]==15~","~n[t]==43~","~r[1]==9~","~r[t]==27))
+sim6_ci$plot1_cov    <- sim6_ci$plot1_cov + labs(title = bquote(~n[1]==19~","~n[t]==53~","~r[1]==13~","~r[t]==37))
+sim6_ci_80$plot1_cov <- sim6_ci_80$plot1_cov + labs(title = bquote(~n[1]==11~","~n[t]==43~","~r[1]==8~","~r[t]==31))
+sim7_ci$plot1_cov    <- sim7_ci$plot1_cov + labs(title = bquote(~n[1]==15~","~n[t]==36~","~r[1]==12~","~r[t]==30))
+sim7_ci_80$plot1_cov <- sim7_ci_80$plot1_cov + labs(title = bquote(~n[1]==6~","~n[t]==27~","~r[1]==5~","~r[t]==23))
+
+
+sim1_ci_cov_80 <- sim1_ci_80$plot1_cov
+sim2_ci_cov_80 <- sim2_ci_80$plot1_cov
+sim3_ci_cov_80 <- sim3_ci_80$plot1_cov
+sim4_ci_cov_80 <- sim4_ci_80$plot1_cov
+sim5_ci_cov_80 <- sim5_ci_80$plot1_cov
+sim6_ci_cov_80 <- sim6_ci_80$plot1_cov
+sim7_ci_cov_80 <- sim7_ci_80$plot1_cov
+
+sim1_ci_cov <- sim1_ci$plot1_cov
+sim2_ci_cov <- sim2_ci$plot1_cov
+sim3_ci_cov <- sim3_ci$plot1_cov
+sim4_ci_cov <- sim4_ci$plot1_cov
+sim5_ci_cov <- sim5_ci$plot1_cov
+sim6_ci_cov <- sim6_ci$plot1_cov
+sim7_ci_cov <- sim7_ci$plot1_cov
+##############################################
+#### Graph for bias and mse paper 90 power####
+##############################################
+grid_arrange_shared_legend(p1 + theme(axis.title.x = element_blank(),axis.text.x = element_blank())+labs(title = bquote(~n[1] == 18~ "," ~ n[t] == 35~ "," ~ r[1] == 3~ "," ~ r[t] == 7)),p5+ theme(axis.title.x = element_blank(),axis.text.x = element_blank())+labs(title = bquote(~n[1] == 24~ "," ~ n[t] == 63~ "," ~ r[1] == 9~ "," ~ r[t] == 25)),p9+ theme(axis.title.x = element_blank(),axis.text.x = element_blank())+labs(title = bquote(~n[1] == 24~ "," ~ n[t] == 61~ "," ~ r[1] == 13~ "," ~ r[t] == 36)),p13+ theme(axis.title.x = element_blank(),axis.text.x = element_blank())+labs(title = bquote(~n[1] == 15~ "," ~ n[t] == 36~ "," ~ r[1] == 12~ "," ~ r[t] == 30)),p2,p6,p10,p14,nrow=2,ncol = 4)
+#################################
+#### Graph for bias and mse  ####
+#################################
+grid_arrange_shared_legend(p1 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==18~","~n[t]==35~","~r[1]==3~","~r[t]==7)), p3 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==19~","~n[t]==54~","~r[1]==5~","~r[t]==16)), p5 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==24~","~n[t]==63~","~r[1]==9~","~r[t]==25)), p7 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==25~","~n[t]==66~","~r[1]==12~","~r[t]==33)), p9+ theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title=bquote(~n[1]==24~","~n[t]==61~","~r[1]==13~","~r[t]==36)), p11 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==19~","~n[t]==53~","~r[1]==13~","~r[t]==37)), p13 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==15~","~n[t]==36~","~r[1]==12~","~r[t]==30)), p2, p4, p6, p8, p10, p12, p14, nrow = 2, ncol = 7)
+grid_arrange_shared_legend(p1_80 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==10~","~n[t]==29~","~r[1]==2~","~r[t]==6)), p3_80 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==13~","~n[t]==43~","~r[1]==4~","~r[t]==13)), p5_80 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==15~","~n[t]==46~","~r[1]==6~","~r[t]==19)), p7_80 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==16~","~n[t]==44~","~r[1]==8~","~r[t]==24)), p9_80+ theme(axis.title.x = element_blank(),axis.text.x = element_blank())+labs(title=bquote(~n[1]==15~","~n[t]==43~","~r[1]==9~","~r[t]==27)), p11_80 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==11~","~n[t]==43~","~r[1]==8~","~r[t]==31)), p13_80 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==6~","~n[t]==27~","~r[1]==5~","~r[t]==23)), p2_80, p4_80, p6_80, p8_80, p10_80, p12_80, p14_80, nrow = 2, ncol = 7)
+grid_arrange_shared_legend(p15_15 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==40~","~n[t]==110~","~r[1]==14~","~r[t]==41)),p17_20 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==9~","~n[t]==63~","~r[1]==9~","~r[t]==25)), p19_25 + theme(axis.title.x = element_blank(),axis.text.x = element_blank()) + labs(title = bquote(~n[1]==15~","~n[t]==40~","~r[1]==6~","~r[t]==17)), p16_15, p18_20, p20_25, nrow = 2, ncol = 3)
+#################################
+#### Graph for coverage paper####
+#################################
+grid.arrange(sim1_ci_cov, sim2_ci_cov, sim3_ci_cov, sim4_ci_cov, sim5_ci_cov, sim6_ci_cov, sim7_ci_cov, nrow=2, ncol = 4)
+grid.arrange(sim1_ci_cov_80, sim2_ci_cov_80, sim3_ci_cov_80, sim4_ci_cov_80, sim5_ci_cov_80, sim6_ci_cov_80, sim7_ci_cov_80, nrow=2, ncol = 4)
+
+#################################
+#### Graph for coverage paper####
+#################################
+p.true.gr <- seq(0, 1, seq.level)
+dat3 <- melt(as.data.frame(cbind(expected_ss_simon7_80 - expected_ss7_80, expected_ss_simon5_80 - expected_ss5_80, expected_ss_simon3_80 - expected_ss3_80, expected_ss_simon1_80 - expected_ss1_80, p.true.gr)),id.vars = "p.true.gr")
+dat3$variable <- revalue(dat3$variable,c("V1"="0.7-0.9","V2"="0.5-0.7","V3"="0.3-0.5","V4"="0.1-0.3"))
+p_exp_80 <- ggplot(data=dat3,aes(y=value,x=p.true.gr))+geom_line(aes(color=variable),size=1)+geom_line(data =dat3[29:37,] ,aes(color=variable),size=2)+geom_line(data =dat3[62:70,] ,aes(color=variable),size=2)+geom_line(data =dat3[95:103,],aes(color=variable) ,size=2)+geom_line(data =dat3[128:136,],aes(color=variable) ,size=2)+theme_light()  +labs(colour = "",x="True p",y="ESS difference",title = "Designs with 80% power")+ylim(0,40)
+
+dat4 <- melt(as.data.frame(cbind(expected_ss_simon7 - expected_ss7, expected_ss_simon5 - expected_ss5, expected_ss_simon3 - expected_ss3, expected_ss_simon1 - expected_ss1, p.true.gr)),id.vars = "p.true.gr")
+dat4$variable <- revalue(dat4$variable,c("V1"="0.7-0.9","V2"="0.5-0.7","V3"="0.3-0.5","V4"="0.1-0.3"))
+p_exp <- ggplot(data=dat4,aes(y=value,x=p.true.gr))+geom_line(aes(color=variable),size=1)+geom_line(data =dat4[29:37,] ,aes(color=variable),size=2)+geom_line(data =dat4[62:70,] ,aes(color=variable),size=2)+geom_line(data =dat4[95:103,],aes(color=variable) ,size=2)+geom_line(data =dat4[128:136,],aes(color=variable) ,size=2)+theme_light()  +labs(colour = "",x="True p",y="ESS difference",title = "Designs with 90% power")+ylim(0,40)
+
+grid_arrange_shared_legend(p_exp_80,p_exp,nrow=1,ncol = 2)
+
+#################################
+#### Graph for coverage supp ####
+#################################
+p.true.gr <- seq(0, 1, seq.level)
+dat3 <- melt(as.data.frame(cbind(expected_ss_simon7_80 - expected_ss7_80, expected_ss_simon6_80 - expected_ss6_80, expected_ss_simon5_80 - expected_ss5_80, expected_ss_simon4_80 - expected_ss4_80, expected_ss_simon3_80 - expected_ss3_80, expected_ss_simon2_80 - expected_ss2_80, expected_ss_simon1_80 - expected_ss1_80, p.true.gr)),id.vars = "p.true.gr")
+dat3$variable <- revalue(dat3$variable,c("V1"="0.7-0.9", "V2"="0.6-0.8", "V3"="0.5-0.7", "V4"="0.4-0.6", "V5"="0.3-0.5", "V6"="0.2-0.4", "V7"="0.1-0.3"))
+p_exp_80 <- ggplot(data=dat3,aes(y=value,x=p.true.gr))+geom_line(aes(color=variable),size=1)+geom_line(data =dat3[29:37,] ,aes(color=variable),size=2)+geom_line(data =dat3[66:74,] ,aes(color=variable),size=2)+geom_line(data =dat3[103:111,],aes(color=variable) ,size=2) + geom_line(data =dat3[140:148,],aes(color=variable) ,size=2) + geom_line(data =dat3[177:185,],aes(color=variable) ,size=2) + geom_line(data =dat3[214:222,],aes(color=variable) ,size=2) + geom_line(data =dat3[251:259,],aes(color=variable) ,size=2) + theme_light() + labs(colour = "",x="True p",y="ESS difference",title = "Designs with 80% power")+ylim(0,40)
+
+dat4 <- melt(as.data.frame(cbind(expected_ss_simon7 - expected_ss7, expected_ss_simon6 - expected_ss6, expected_ss_simon5 - expected_ss5, expected_ss_simon4 - expected_ss4, expected_ss_simon3 - expected_ss3, expected_ss_simon2 - expected_ss2, expected_ss_simon1 - expected_ss1, p.true.gr)),id.vars = "p.true.gr")
+dat4$variable <- revalue(dat4$variable,c("V1"="0.7-0.9", "V2"="0.6-0.8", "V3"="0.5-0.7", "V4"="0.4-0.6", "V5"="0.3-0.5", "V6"="0.2-0.4", "V7"="0.1-0.3"))
+p_exp <- ggplot(data=dat4,aes(y=value,x=p.true.gr))+geom_line(aes(color=variable),size=1)+geom_line(data =dat4[29:37,] ,aes(color=variable),size=2)+geom_line(data =dat4[66:74,] ,aes(color=variable),size=2)+geom_line(data =dat4[103:111,],aes(color=variable) ,size=2)+geom_line(data =dat4[140:148,],aes(color=variable) ,size=2) + geom_line(data =dat4[177:185,],aes(color=variable) ,size=2) + geom_line(data =dat4[214:222,],aes(color=variable) ,size=2) + geom_line(data =dat4[251:259,],aes(color=variable) ,size=2) + theme_light()  +labs(colour = "",x="True p",y="ESS difference",title = "Designs with 90% power")+ylim(0,40)
+
+dat5 <- melt(as.data.frame(cbind(expected_ss_simon7_15 - expected_ss7_15, expected_ss_simon7_20 - expected_ss7_20, expected_ss_simon7_25 - expected_ss7_25,p.true.gr)),id.vars = "p.true.gr")
+dat5$variable <- revalue(dat5$variable,c("V1"="0.3-0.45", "V2"="0.3-0.5", "V3"="0.3-0.55"))
+p_exp_15 <- ggplot(data=dat5, aes(y=value,x=p.true.gr)) + geom_line(aes(color=variable),size=1) + geom_line(data =dat5[13:19,] ,aes(color=variable),size=2) + geom_line(data =dat5[54:62,] ,aes(color=variable),size=2) + geom_line(data =dat5[95:105,],aes(color=variable) ,size=2) + theme_light() + labs(colour = "",x="True p",y="ESS difference",title = "Designs with different p0 - p1")+ylim(0,70)
+
+grid_arrange_shared_legend(p_exp_80,p_exp,p_exp_15,nrow=1,ncol = 3)
+
+
+####
+#ESS table
+
+expected_ss_simon1[5]
+expected_ss_simon2[9]
+expected_ss_simon3[13]
+expected_ss_simon4[17]
+expected_ss_simon5[21]
+expected_ss_simon6[25]
+expected_ss_simon7[29]
+
+expected_ss1[5]
+expected_ss2[9]
+expected_ss3[13]
+expected_ss4[17]
+expected_ss5[21]
+expected_ss6[25]
+expected_ss7[29]
+
+expected_ss_simon1_80[5]
+expected_ss_simon2_80[9]
+expected_ss_simon3_80[13]
+expected_ss_simon4_80[17]
+expected_ss_simon5_80[21]
+expected_ss_simon6_80[25]
+expected_ss_simon7_80[29]
+
+expected_ss1_80[5]
+expected_ss2_80[9]
+expected_ss3_80[13]
+expected_ss4_80[17]
+expected_ss5_80[21]
+expected_ss6_80[25]
+expected_ss7_80[29]
